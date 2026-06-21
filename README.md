@@ -6,7 +6,40 @@ An advanced, reconstruction-free Model-Based Reinforcement Learning (MBRL) pipel
 
 Traditional world models (like DreamerV3) waste high-dimensional neural capacity trying to reconstruct complex visual backgrounds. JEPA-Dreamer completely removes pixel-reconstruction loss loops. 
 
-Use code with caution.[Raw KUKA Render View] ──> [Spatial Transformer (STN)] ──> [Frozen LeWM Base (SIGReg)]│┌────────────────────────────────────────────────────────────────┘▼[LEGION Cluster Allocator]├── Match Found ────> [Route to Existing MuDreamer Core Head]└── Match Dropped ──> [Instantiate Brand New Multi-Step Skill Core]│▼[Latent H-Horizon Imagination](Optimized via Lambda-Returns)
+Use code with caution.
+```mermaid
+flowchart TB
+
+    subgraph Perception
+        A[Raw KUKA Render View]
+        B[Spatial Transformer Network]
+        C[Frozen LeWM Base Encoder]
+        A --> B --> C
+    end
+
+    subgraph Lifelong Learning
+        D[LEGION Cluster Allocator]
+    end
+
+    subgraph Skill Memory
+        E[Existing MuDreamer Core]
+        F[New Multi-Step Skill Core]
+    end
+
+    subgraph Planning
+        G[Latent H-Horizon Imagination]
+        H[Lambda-Return Optimization]
+        G --> H
+    end
+
+    C --> D
+    D -->|Known Skill| E
+    D -->|Novel Skill| F
+
+    E --> G
+    F --> G
+```
+
 ### Key Advantages
 * **Immunity to Visual Drifts:** The frozen LeWorldModel base utilizes a `SIGReg` regularizer to bound features into an isotropic Gaussian distribution, completely neutralizing visual noise.
 * **Camera Perspective Invariance:** A front-end Spatial Transformer Network (STN) actively registers shifting camera angles back into canonical view alignments before feature encoding.
