@@ -1,0 +1,62 @@
+# ==============================================================================
+# LEGION + JEPA-Dreamer Lifelong Multitask Framework Configuration
+# Target Suite: Metaworld-KUKA-IIWA-R800 (MT10 / MT50 KUKA Adaptations)
+# ==============================================================================
+
+# Framework Global Infrastructure
+system:
+  seed: 42
+  device: "cuda"
+  checkpoint_dir: "./checkpoints/legion_jepa_dreamer"
+  log_interval: 1000
+
+# LEGION Lifelong Non-Parametric Model Parameters
+legion:
+  knowledge_space:
+    max_components: 30              # Max latent task heads to grow dynamically
+    expansion_threshold: 0.3       # Similarity drop trigger to spawn a new MuDreamer Core
+    forgetting_factor: 0.0          # Set to 0.0 because LeWM frozen features prevent drift
+  task_vector_type: "one_hot"       # Structural identification across KUKA environments
+  replay_buffer:
+    pixel_capacity: 50000           # Scaled down drastically (only stores input roots, no frames for decoding)
+    state_capacity: 500000          # Vector trajectories used for imagination initialization
+    max_size: 100000                # Total capacity for latent trajectories and rewards
+
+# LeWorldModel (LeWM) Frozen Visual Component
+lewm_encoder:
+  input_resolution: [3, 224, 224]  # From KUKA Mujoco simulator render channels
+  embed_dim: 512                   # Unified latent dimension size
+  sigreg_regularized: true         # Forces isotropic Gaussian geometry bounding
+  pretrained_weights: "weights/lewm_kuka_shared_base.pt"
+  freeze_weights: true             # Prevents cross-task interference during expansion
+
+# MuDreamer Task-Specific Policy Core (Spawned dynamically per LEGION component)
+mudreamer_core:
+  horizon: 15                      # Multi-step internal imagination window length
+  batch_size: 64                   # Latent batch elements for imagined training
+  discount: 0.99                   # Reinforcement Learning target decay factor
+  lambda_: 0.95                    # GAE lambda parameter for value head
+  networks:
+    hidden_dim: 256
+    activation: "elu"
+  optimizer:
+    lr_actor: 0.0001
+    lr_critic: 0.0003
+    lr_predictor: 0.0003
+
+# Metaworld-KUKA-IIWA-R800 Specific Configurations
+environment:
+  # suite: "metaworld_kuka"
+  # tasks: ["kuka-reach-v2", "kuka-push-v2", "kuka-pick-place-v2", "kuka-door-open-v2"]
+  suite: "metaworld"
+  tasks:
+    - assembly-v3
+    - reach-v3
+    - push-v3
+    - pick-place-v3
+    - door-open-v3
+  render_mode: "rgb_array"          # Directly routed into LeWMEncoder
+  action_dim: 4                    # KUKA arm xyz control + continuous gripper actuation
+  reward_mapping:
+    normalize_rewards: true        # Rescales custom KUKA reward components uniformly
+    clip_range: [-10.0, 10.0]
