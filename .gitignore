@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Conda
+env/
+envs/
+
+# Training outputs
+checkpoints/
+models/
+runs/
+wandb/
+logs/
+
+# Data
+data/
+datasets/
+
+# MuJoCo
+.mujoco/
+
+# Large artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npy
+*.npz
+*.pkl
+*.pickle
