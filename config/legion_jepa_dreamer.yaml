@@ -29,6 +29,11 @@ lewm_encoder:
   sigreg_regularized: true         # Forces isotropic Gaussian geometry bounding
   pretrained_weights: "weights/lewm_kuka_shared_base.pt"
   freeze_weights: true             # Prevents cross-task interference during expansion
+  # Switch this to run ablations:
+  # "lewm"      -> pretrained JEPA + SIGReg, frozen (default)
+  # "mudreamer"  -> plain CNN + BatchNorm, trains jointly with world model
+  # "random"    -> frozen random CNN (lower bound)
+  encoder_type: "random"
 
 # MuDreamer Task-Specific Policy Core (Spawned dynamically per LEGION component)
 mudreamer_core:
