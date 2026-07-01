@@ -148,19 +148,19 @@ def pretrain(
     )
     print(f"[*] Saved pretrained LeWM checkpoint to: {out_path}")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tasks",
         nargs="+",
         default=["reach-v3", "push-v3", "pick-place-v3", "door-open-v3"],
-        help="MetaWorld task names to collect rollouts from",
     )
     parser.add_argument("--embed_dim", type=int, default=512)
     parser.add_argument("--action_dim", type=int, default=4)
-    parser.add_argument("--steps_per_task", type=int, default=2000)
-    parser.add_argument("--train_epochs", type=int, default=20)
+    # Increased from 2000: gives encoder sufficient coverage of each task's
+    # observation distribution before freezing for Phase 2
+    parser.add_argument("--steps_per_task", type=int, default=10000)
+    parser.add_argument("--train_epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--out_path", type=str, default="weights/lewm_kuka_shared_base.pt")

@@ -121,7 +121,11 @@ environment:
 To launch the multi-task lifelong reinforcement loop, run the orchestrator script:
 
 ```bash
-python run_pipeline.py
+# Re-pretrain with more data (delete old checkpoint first)
+python pretrain_lewm.py --steps_per_task 10000 --train_epochs 50
+
+# Then run ablations
+python run_pipeline.py  # change encoder_type in config between runs
 ```
 
 ### Telemetry Performance Tracking

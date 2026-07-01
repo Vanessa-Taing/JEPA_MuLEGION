@@ -53,6 +53,14 @@ class RandomFrozenEncoder(nn.Module):
     Randomly initialized, permanently frozen CNN. Used as a lower-bound
     ablation — establishes what DPMM + MuDreamer achieves with zero perceptual
     learning, attributing any gains purely to the downstream RL components.
+
+    LayerNorm on the output is required even though weights never update —
+    without it, random init can produce embeddings of arbitrary, unbounded
+    magnitude, which destabilizes every downstream component (predictor,
+    critic, symexp) that assumes roughly unit-scale latents like the other
+    two encoder conditions provide. This keeps the ablation comparison fair:
+    differences in results should reflect encoder *quality*, not encoder
+    *output scale*.
     """
     def __init__(self, c_in=3, embed_dim=512):
         super().__init__()
@@ -67,6 +75,7 @@ class RandomFrozenEncoder(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             nn.LazyLinear(embed_dim),
+            nn.LayerNorm(embed_dim),
         )
         for p in self.parameters():
             p.requires_grad = False

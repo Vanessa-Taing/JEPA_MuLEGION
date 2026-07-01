@@ -1,67 +1,72 @@
-# ==============================================================================
-# LEGION + JEPA-Dreamer Lifelong Multitask Framework Configuration
-# Target Suite: Metaworld-KUKA-IIWA-R800 (MT10 / MT50 KUKA Adaptations)
-# ==============================================================================
-
-# Framework Global Infrastructure
 system:
   seed: 42
   device: "cuda"
   checkpoint_dir: "./checkpoints/legion_jepa_dreamer"
   log_interval: 1000
+  eval_interval: 1000
+  eval_episodes: 5
+  total_steps: 50000
 
-# LEGION Lifelong Non-Parametric Model Parameters
+# Encoder warmup: freeze encoder gradient updates for this many steps
+# even in mudreamer mode — gives predictor/critic time to stabilize
+# before their input distribution starts shifting. Irrelevant for
+# lewm and random conditions (encoder is always frozen there).
+encoder_warmup_steps: 2000
+
 legion:
   knowledge_space:
-    max_components: 30              # Max latent task heads to grow dynamically
-    expansion_threshold: 0.3       # Similarity drop trigger to spawn a new MuDreamer Core
-    forgetting_factor: 0.0          # Set to 0.0 because LeWM frozen features prevent drift
-  task_vector_type: "one_hot"       # Structural identification across KUKA environments
+    max_components: 30
+    expansion_threshold: 0.3
+    forgetting_factor: 0.0
+  task_vector_type: "one_hot"
   replay_buffer:
-    pixel_capacity: 50000           # Scaled down drastically (only stores input roots, no frames for decoding)
-    state_capacity: 500000          # Vector trajectories used for imagination initialization
-    max_size: 100000                # Total capacity for latent trajectories and rewards
+    pixel_capacity: 50000
+    state_capacity: 500000
+    max_size: 100000
 
-# LeWorldModel (LeWM) Frozen Visual Component
 lewm_encoder:
-  input_resolution: [3, 224, 224]  # From KUKA Mujoco simulator render channels
-  embed_dim: 512                   # Unified latent dimension size
-  sigreg_regularized: true         # Forces isotropic Gaussian geometry bounding
+  input_resolution: [3, 224, 224]
+  embed_dim: 512
+  sigreg_regularized: true
   pretrained_weights: "weights/lewm_kuka_shared_base.pt"
-  freeze_weights: true             # Prevents cross-task interference during expansion
-  # Switch this to run ablations:
-  # "lewm"      -> pretrained JEPA + SIGReg, frozen (default)
+  freeze_weights: true
+  # "lewm"      -> pretrained JEPA + SIGReg, frozen
   # "mudreamer"  -> plain CNN + BatchNorm, trains jointly with world model
   # "random"    -> frozen random CNN (lower bound)
-  encoder_type: "random"
+  encoder_type: "lewm"
 
-# MuDreamer Task-Specific Policy Core (Spawned dynamically per LEGION component)
 mudreamer_core:
-  horizon: 15                      # Multi-step internal imagination window length
-  batch_size: 64                   # Latent batch elements for imagined training
-  discount: 0.99                   # Reinforcement Learning target decay factor
-  lambda_: 0.95                    # GAE lambda parameter for value head
+  horizon: 15
+  batch_size: 64
+  discount: 0.99
+  lambda_: 0.95
   networks:
     hidden_dim: 256
     activation: "elu"
   optimizer:
-    lr_actor: 0.0001
-    lr_critic: 0.0003
-    lr_predictor: 0.0003
+    lr_actor: 0.00003
+    lr_critic: 0.0001
+    lr_predictor: 0.0001
 
-# Metaworld-KUKA-IIWA-R800 Specific Configurations
+# BTN: set enabled: false to run without BTN (ablation condition)
+btn:
+  enabled: false
+  n_subjects: 30
+  n_predicates: 15
+  n_objects: 30
+  vocab_embed_dim: 64
+  conditioning_dim: 128
+  lr: 0.0003
+
 environment:
-  # suite: "metaworld_kuka"
-  # tasks: ["kuka-reach-v2", "kuka-push-v2", "kuka-pick-place-v2", "kuka-door-open-v2"]
   suite: "metaworld"
   tasks:
-    - assembly-v3
     - reach-v3
     - push-v3
     - pick-place-v3
     - door-open-v3
-  render_mode: "rgb_array"          # Directly routed into LeWMEncoder
-  action_dim: 4                    # KUKA arm xyz control + continuous gripper actuation
+  render_mode: "rgb_array"
+  action_dim: 4
   reward_mapping:
-    normalize_rewards: true        # Rescales custom KUKA reward components uniformly
+    normalize_rewards: true
     clip_range: [-10.0, 10.0]
