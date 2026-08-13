@@ -5,12 +5,8 @@ system:
   log_interval: 1000
   eval_interval: 1000
   eval_episodes: 5
-  total_steps: 50000
+  total_steps: 20000 #150000 baseline
 
-# Encoder warmup: freeze encoder gradient updates for this many steps
-# even in mudreamer mode — gives predictor/critic time to stabilize
-# before their input distribution starts shifting. Irrelevant for
-# lewm and random conditions (encoder is always frozen there).
 encoder_warmup_steps: 2000
 
 legion:
@@ -30,16 +26,22 @@ lewm_encoder:
   sigreg_regularized: true
   pretrained_weights: "weights/lewm_kuka_shared_base.pt"
   freeze_weights: true
-  # "lewm"      -> pretrained JEPA + SIGReg, frozen
-  # "mudreamer"  -> plain CNN + BatchNorm, trains jointly with world model
-  # "random"    -> frozen random CNN (lower bound)
-  encoder_type: "lewm"
+  encoder_type: "lewm" #lewm or mudreamer or random
 
 mudreamer_core:
   horizon: 15
-  batch_size: 64
+  batch_size: 16          # reduced from 64 — sequence batches are more expensive
+  sequence_length: 50     # steps per training sequence
+  max_episodes: 500       # episode storage capacity
+  min_episodes_before_train: 10   # wait for 10 complete episodes before training
+  action_mean_penalty: 0.00003   # tried 1e-3
   discount: 0.99
   lambda_: 0.95
+  kl_weight: 1.0
+  rssm:
+    deter_dim: 256
+    stoch_dim: 16
+    stoch_classes: 16
   networks:
     hidden_dim: 256
     activation: "elu"
@@ -48,9 +50,8 @@ mudreamer_core:
     lr_critic: 0.0001
     lr_predictor: 0.0001
 
-# BTN: set enabled: false to run without BTN (ablation condition)
 btn:
-  enabled: false
+  enabled: true
   n_subjects: 30
   n_predicates: 15
   n_objects: 30

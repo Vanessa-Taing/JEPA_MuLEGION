@@ -178,11 +178,27 @@ class BTNTrainer:
 
     1. Entropy regularization: prevents all frames collapsing to the same triple.
        High entropy is desired early — the BTN should spread probability mass
-       across vocabulary before it has enough signal to commit.
+       across vocabulary before it has enough signal to commit. Now ANNEALED
+       over training (see entropy_weight_min / entropy_decay_steps below) —
+       previously this weight was fixed for the entire run, meaning the BTN
+       was permanently prevented from ever committing to differentiated,
+       state-dependent triples, no matter how much real training happened.
 
-    2. Consistency loss: similar latents should produce similar triples.
-       Implemented as MSE between triple logits of a latent and the mean
-       logits of its batch — pushes similar observations toward agreement.
+    2. Consistency loss — REWORKED. The original formulation compared each
+       sample's triple logits to the DETACHED MEAN of the whole training
+       batch and minimized that distance for every sample. Since a training
+       batch is drawn from many different timesteps/states, this actively
+       trained every state — however physically different — toward emitting
+       the SAME average triple. Diagnostic evidence (BTN conditioning
+       std-across-time collapsing to ~0.002 and staying pinned there for the
+       entire remainder of a 50k-step run, immediately once real training
+       began) confirmed this was actively erasing state-dependence rather
+       than encouraging "similar states -> similar triples" as intended.
+       Disabled by default (consistency_weight=0.0) until reformulated with
+       genuine local/pairwise similarity structure rather than a global
+       batch-mean pull. The loss code path is left in place (not deleted)
+       so it can still be opted into deliberately, but it is inert unless a
+       non-zero weight is explicitly passed.
 
     No explicit triple labels are needed. The BTN is supervised indirectly
     through the actor's policy gradient (conditioning improves actions ->
@@ -193,14 +209,35 @@ class BTNTrainer:
         btn,
         lr=3e-4,
         entropy_weight=0.1,
-        consistency_weight=0.05,
+        entropy_weight_min=0.01,
+        entropy_decay_steps=20000,
+        consistency_weight=0.0,
         grad_clip=10.0,
     ):
         self.btn = btn
         self.optimizer = optim.Adam(self.btn.parameters(), lr=lr)
-        self.entropy_weight = entropy_weight
+        self.entropy_weight_start = entropy_weight
+        self.entropy_weight_min = entropy_weight_min
+        self.entropy_decay_steps = max(entropy_decay_steps, 1)
         self.consistency_weight = consistency_weight
         self.grad_clip = grad_clip
+        self._step = 0
+
+    def _current_entropy_weight(self):
+        """
+        Linear anneal from entropy_weight_start down to entropy_weight_min
+        over entropy_decay_steps calls to train_step. Early in training, high
+        entropy weight keeps the vocabulary from collapsing to a single triple
+        before there's enough signal to differentiate states. As training
+        progresses, relaxing this weight lets the BTN actually commit to
+        state-dependent triples instead of being permanently held at a
+        near-uniform (and thus near input-invariant) distribution.
+        """
+        progress = min(self._step / self.entropy_decay_steps, 1.0)
+        return (
+            self.entropy_weight_start
+            + progress * (self.entropy_weight_min - self.entropy_weight_start)
+        )
 
     def train_step(self, latent_batch):
         """
@@ -211,6 +248,8 @@ class BTNTrainer:
         # Forward pass — no wm_hidden for batch training (no sequence context)
         _, _, triple_logits = self.btn(latent_batch, wm_hidden=None)
 
+        entropy_weight = self._current_entropy_weight()
+
         total_loss = torch.tensor(0.0, device=latent_batch.device)
         entropy_sum = torch.tensor(0.0, device=latent_batch.device)
 
@@ -220,17 +259,27 @@ class BTNTrainer:
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
             entropy_sum = entropy_sum + entropy
 
-            # Consistency: triple logits should be similar within the batch
-            # (MetaWorld frames within the same task should share coarse structure)
-            mean_logits = logits.mean(dim=0, keepdim=True).detach()
-            consistency = torch.mean((logits - mean_logits) ** 2)
-            total_loss = total_loss + self.consistency_weight * consistency
+            # Consistency term is a no-op unless explicitly enabled — see
+            # class docstring for why the original always-on version was
+            # actively harmful (pulled every sample toward the batch mean
+            # regardless of whether the underlying states actually differed).
+            if self.consistency_weight > 0:
+                mean_logits = logits.mean(dim=0, keepdim=True).detach()
+                consistency = torch.mean((logits - mean_logits) ** 2)
+                total_loss = total_loss + self.consistency_weight * consistency
 
-        # Maximize entropy (minimize negative entropy) — prevents collapse
-        total_loss = total_loss - self.entropy_weight * entropy_sum
+        # Maximize entropy (minimize negative entropy) — prevents collapse,
+        # weight now decays over training instead of staying fixed forever.
+        total_loss = total_loss - entropy_weight * entropy_sum
 
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.btn.parameters(), self.grad_clip)
         self.optimizer.step()
 
-        return {"btn_loss": total_loss.item(), "btn_entropy": entropy_sum.item()}
+        self._step += 1
+
+        return {
+            "btn_loss": total_loss.item(),
+            "btn_entropy": entropy_sum.item(),
+            "btn_entropy_weight": entropy_weight,
+        }
