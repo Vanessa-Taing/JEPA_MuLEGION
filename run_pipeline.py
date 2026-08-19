@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import yaml
 import numpy as np
 import torch
@@ -48,15 +49,9 @@ def evaluate_policy(
     total_reward = 0.0
     total_success = 0
     final_distances = []
-    # Diagnostics for the "tanh saturation trap" and "BTN conditioning acts
-    # as a near-constant bias" hypotheses: if final_distance is frozen while
-    # other metrics move, we need to know whether the ACTIONS being sent to
-    # the env are pinned near the tanh boundary (+/-1), and whether the BTN
-    # conditioning vector is actually varying across the episode or
-    # collapsing to something close to constant regardless of state.
-    all_action_abs_means = []       # per-step mean |action| across episodes
-    all_action_saturated_fracs = [] # per-step fraction of |action| > 0.99
-    per_episode_conditioning_stds = []  # std of conditioning vector ACROSS TIME within an episode
+    all_action_abs_means = []
+    all_action_saturated_fracs = []
+    per_episode_conditioning_stds = []
 
     was_training = base_encoder.training
     base_encoder.eval()
@@ -83,7 +78,6 @@ def evaluate_policy(
             with torch.no_grad():
                 aligned = stn_aligner(pixel_input)
                 obs_embed = base_encoder(aligned)
-                # Eval uses posterior step — carry h across episode
                 rssm.posterior_net.eval()
                 h, z, _, _ = rssm.observe_step(h, z, prev_action, obs_embed)
                 state = rssm.get_state_features(h, z)
@@ -108,22 +102,12 @@ def evaluate_policy(
             prev_action = action
 
         if len(episode_conditioning_vectors) > 1:
-            cond_arr = np.stack(episode_conditioning_vectors)  # (T, conditioning_dim)
-            # Mean std across the conditioning dim, computed across TIME —
-            # near-zero means the BTN is emitting roughly the same vector
-            # every step regardless of how the state actually changed.
+            cond_arr = np.stack(episode_conditioning_vectors)
             per_episode_conditioning_stds.append(float(cond_arr.std(axis=0).mean()))
 
         total_reward += ep_reward
         total_success += int(last_info.get("success", 0.0) > 0.5)
 
-        # MetaWorld envs commonly expose a gripper/object-to-target distance
-        # in info under one of these keys depending on env version. This is
-        # the metric that distinguishes "policy moves toward the goal but
-        # can't close the last few cm" from "policy isn't heading there at
-        # all" — something reward/success alone can't tell apart. We check
-        # several known key names and skip silently if none are present so
-        # this never breaks eval on an unexpected MetaWorld version.
         for dist_key in ("obj_to_target", "distance_to_target", "reachDist", "target_to_obj"):
             if dist_key in last_info:
                 final_distances.append(float(last_info[dist_key]))
@@ -153,14 +137,6 @@ def evaluate_policy(
 
 
 class _Tee:
-    """
-    Minimal stdout duplicator: every print() still shows up in the console
-    exactly as before, AND is simultaneously written to a timestamped log
-    file. This is a pure side-channel — it doesn't touch TensorBoard or any
-    training logic, it just captures the same console output you've been
-    manually copy-pasting back for review, so every run is saved
-    automatically without needing to remember to redirect output yourself.
-    """
     def __init__(self, *streams):
         self.streams = streams
 
@@ -175,9 +151,6 @@ class _Tee:
 
 
 def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
-    # Save every run's console output to runs/run_<timestamp>.txt, in
-    # addition to printing normally. Directory and file are created fresh
-    # each call, so concurrent/repeated runs never overwrite each other.
     runs_dir = "runs"
     os.makedirs(runs_dir, exist_ok=True)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -188,6 +161,26 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
 
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
+
+    # ---- Reproducibility ----
+    # system.seed was present in the config but never actually applied
+    # anywhere — every run (including hyperparameter sweeps) was running
+    # under an uncontrolled, system-entropy-derived random seed. This meant
+    # apparent differences between two runs of the SAME config could be
+    # pure random variance rather than a real effect of whatever was
+    # changed. Fixing torch/numpy/python's RNGs here makes the seed value
+    # actually do something. Full bit-for-bit determinism isn't guaranteed
+    # (some CUDA/cuDNN ops are inherently nondeterministic even with a
+    # fixed seed), but this removes the majority of run-to-run variance and
+    # is a large step toward being able to trust A/B comparisons between
+    # different hyperparameter values, and toward a reproducible pitch demo.
+    seed = cfg["system"].get("seed", 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"[*] Seeded random/numpy/torch with seed={seed}")
 
     device = torch.device(cfg["system"]["device"] if torch.cuda.is_available() else "cpu")
     encoder_type = cfg["lewm_encoder"].get("encoder_type", "lewm")
@@ -223,15 +216,10 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         checkpoint_path=cfg["lewm_encoder"].get("pretrained_weights"),
     )
 
-    # Sequence buffer: for RSSM training (sequential, propagates h).
-    # Episodes are tagged with a majority-vote task_id so sample_sequences()
-    # can be filtered per cluster (see lifelong.py).
     seq_buffer = SequenceReplayBuffer(
         max_episodes=cfg["mudreamer_core"].get("max_episodes", 500),
         sequence_length=seq_len,
     )
-    # Flat buffer: for actor-critic imagination seeding. Transitions are
-    # tagged per-step with task_id so sample() can be filtered per cluster.
     flat_buffer = LegionReplayBuffer(
         max_size=cfg["legion"]["replay_buffer"]["max_size"]
     )
@@ -261,29 +249,30 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
 
     total_steps = cfg["system"].get("total_steps", 50000)
     horizon = cfg["mudreamer_core"]["horizon"]
-    # min episodes before we start RSSM training — need enough sequences
     min_episodes = cfg["mudreamer_core"].get("min_episodes_before_train", 10)
     eval_interval = cfg["system"].get("eval_interval", 1000)
     eval_episodes = cfg["system"].get("eval_episodes", 5)
 
-    # ---- Actor/critic warmup gate ----
-    # The world model receives ZERO real gradient updates until seq_buffer
-    # has min_episodes full episodes (world_model_loss is nan before that —
-    # see the diagnostic run). Prior to this fix, the actor and critic
-    # trained every step regardless, imagining against a completely
-    # untrained/random RSSM for that entire stretch. The instant the RSSM
-    # gets its first real update, its reward/dynamics predictions shift
-    # discontinuously, and an actor/critic pair that has already converged
-    # toward exploiting the old (random) dynamics gets hit with a target
-    # shift it can't absorb — this is what produced the Critic:10.3 /
-    # Actor:-75.4 spike and the subsequent frozen, collapsed policy.
-    # Fix: don't let the actor/critic take gradient steps until the world
-    # model has accumulated `wm_warmup_updates` real training steps of its
-    # own. Imagination rollouts still run (needed to keep the code path
-    # exercised and for logging), but their gradients are discarded during
-    # warmup so the policy can't be shaped by an untrained model.
     wm_warmup_updates = cfg["mudreamer_core"].get("wm_warmup_updates", 200)
     task_wm_update_counts = {}
+
+    # ---- Checkpointing ----
+    # checkpoint_interval: how often (in steps) to write a rolling checkpoint.
+    # resume: OPT-IN, defaults to False. This default matters: without it,
+    # every run would silently resume from whatever checkpoint happens to
+    # exist in checkpoint_dir, which would be actively dangerous during
+    # hyperparameter sweeps (e.g. testing different action_mean_penalty
+    # values) — you'd otherwise be quietly continuing training under a
+    # DIFFERENT hyperparameter than the one you just changed, with no
+    # indication anything unusual happened. Set system.resume: true in the
+    # yaml explicitly when you want to continue a specific run in stages
+    # (e.g. the "run 150k, check trend, extend" workflow), and use a
+    # distinct checkpoint_dir per experiment/config you don't want to mix.
+    checkpoint_interval = cfg["system"].get("checkpoint_interval", 10000)
+    resume_enabled = cfg["system"].get("resume", False)
+    checkpoint_dir = cfg["system"]["checkpoint_dir"]
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
 
     def get_aligned_pixels():
         raw_frame = env.render()
@@ -346,18 +335,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             kl_weight=cfg["mudreamer_core"].get("kl_weight", 1.0),
         )
 
-        # BTN is constructed BEFORE the actor trainer now, so its parameters
-        # can be passed in as an auxiliary param group. This is the fix for
-        # the optimizer-scoping bug: previously the actor's backward pass
-        # genuinely computed gradients on the BTN's parameters (since the
-        # BTN sits inside the imagination rollout feeding the actor), but
-        # nothing ever applied them — BTNTrainer's own optimizer only
-        # covered btn.parameters() via a SEPARATE, entropy-only forward
-        # pass, and its zero_grad() wiped the actor-derived gradients before
-        # they were ever used. Now MuDreamerActorTrainer's optimizer
-        # includes btn.parameters() as a second param group (at a reduced
-        # lr, see auxiliary_lr_scale), so the policy-gradient signal that
-        # was already being computed actually gets applied.
         btn = None
         if use_btn:
             btn_cfg = cfg["btn"]
@@ -370,10 +347,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                 conditioning_dim=btn_cfg["conditioning_dim"],
             ).to(device)
             task_btns[task_id] = btn
-            # BTNTrainer's entropy-maximization loss remains as a separate,
-            # complementary stabilizer (prevents the vocabulary collapsing
-            # to a single triple), but is no longer the ONLY signal the BTN
-            # receives.
             task_btn_trainers[task_id] = BTNTrainer(
                 btn=btn, lr=btn_cfg.get("lr", 3e-4)
             )
@@ -386,7 +359,84 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             action_mean_penalty=cfg["mudreamer_core"].get("action_mean_penalty", 3e-5),
         )
 
-    # Live RSSM state — carried across steps within an episode
+    def save_checkpoint(step):
+        """
+        Saves model + optimizer state for every active task cluster, plus
+        the DPMM allocator's cluster profiles and the reward normalizer's
+        running statistics, in a single rolling file (overwritten each
+        call). NOTE: replay buffer contents are intentionally NOT persisted
+        — re-accumulating a few thousand transitions after resume is cheap
+        relative to checkpoint file size and save/load time, and the
+        actor/critic warmup gate (tied to real WM update COUNT, which IS
+        persisted via task_wm_update_counts) means resuming won't re-trigger
+        the untrained-world-model shock from bug #2 even with empty buffers.
+        """
+        state = {
+            "step": step,
+            "allocator_component_profiles": allocator.component_profiles,
+            "task_wm_update_counts": task_wm_update_counts,
+            "reward_normalizer_mean": reward_normalizer.mean,
+            "reward_normalizer_var": reward_normalizer.var,
+            "tasks": {},
+        }
+        for tid in task_rssms:
+            task_state = {
+                "rssm": task_rssms[tid].state_dict(),
+                "actor_critic": task_actor_critics[tid].state_dict(),
+                "value_optimizer": task_value_trainers[tid].optimizer.state_dict(),
+                "target_critic": task_value_trainers[tid].target_critic.state_dict(),
+                "wm_optimizer": task_wm_trainers[tid].optimizer.state_dict(),
+                "actor_optimizer": task_actor_trainers[tid].optimizer.state_dict(),
+            }
+            if tid in task_btns:
+                task_state["btn"] = task_btns[tid].state_dict()
+                task_state["btn_optimizer"] = task_btn_trainers[tid].optimizer.state_dict()
+            state["tasks"][tid] = task_state
+
+        tmp_path = checkpoint_path + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, checkpoint_path)  # atomic-ish swap: avoids a
+        # half-written file if the process is killed mid-save
+        print(f"[*] Checkpoint saved at step {step}: {checkpoint_path}")
+
+    def try_resume():
+        if not resume_enabled:
+            print("[*] system.resume is False (default) — starting fresh. "
+                  "Set system.resume: true in the config to continue from "
+                  f"{checkpoint_path} if it exists.")
+            return 0
+        if not os.path.exists(checkpoint_path):
+            print(f"[*] system.resume is True but no checkpoint found at "
+                  f"{checkpoint_path} — starting fresh.")
+            return 0
+
+        print(f"[*] Resuming from checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+        allocator.component_profiles = ckpt["allocator_component_profiles"]
+        task_wm_update_counts.update(ckpt["task_wm_update_counts"])
+        reward_normalizer.mean = ckpt["reward_normalizer_mean"]
+        reward_normalizer.var = ckpt["reward_normalizer_var"]
+
+        for tid, task_state in ckpt["tasks"].items():
+            ensure_task_modules(tid)  # builds fresh modules with correct shapes
+            task_rssms[tid].load_state_dict(task_state["rssm"])
+            task_actor_critics[tid].load_state_dict(task_state["actor_critic"])
+            task_value_trainers[tid].optimizer.load_state_dict(task_state["value_optimizer"])
+            task_value_trainers[tid].target_critic.load_state_dict(task_state["target_critic"])
+            task_wm_trainers[tid].optimizer.load_state_dict(task_state["wm_optimizer"])
+            task_actor_trainers[tid].optimizer.load_state_dict(task_state["actor_optimizer"])
+            if "btn" in task_state and tid in task_btns:
+                task_btns[tid].load_state_dict(task_state["btn"])
+                task_btn_trainers[tid].optimizer.load_state_dict(task_state["btn_optimizer"])
+
+        resumed_step = ckpt["step"] + 1
+        print(f"[*] Resumed at step {resumed_step} "
+              f"({len(ckpt['tasks'])} task cluster(s) restored)")
+        return resumed_step
+
+    start_step = try_resume()
+
     current_pixels = get_aligned_pixels()
     current_obs_embed = encode(current_pixels)
     live_h = None
@@ -395,9 +445,8 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
     current_task_id = None
     bootstrap_state = torch.zeros(1, state_dim, device=device)
 
-    for step in range(total_steps):
+    for step in range(start_step, total_steps):
 
-        # ---- Task allocation ----
         if live_h is not None and current_task_id is not None:
             alloc_state = task_rssms[current_task_id].get_state_features(live_h, live_z)
         else:
@@ -419,7 +468,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         active_btn = task_btns.get(task_id, None)
         active_btn_trainer = task_btn_trainers.get(task_id, None)
 
-        # ---- Posterior step: update live RSSM with current observation ----
         active_rssm.posterior_net.eval()
         with torch.no_grad():
             live_h, live_z, _, _ = active_rssm.observe_step(
@@ -428,7 +476,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         active_rssm.posterior_net.train()
         live_state = active_rssm.get_state_features(live_h, live_z)
 
-        # ---- Act ----
         with torch.no_grad():
             live_conditioning = None
             if active_btn is not None:
@@ -442,10 +489,7 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         next_pixels = get_aligned_pixels()
         next_obs_embed = encode(next_pixels)
 
-        # ---- Store in BOTH buffers, tagged with the current DPMM cluster ----
-        # Sequence buffer: for sequential RSSM training
         seq_buffer.add_step(current_obs_embed, real_action, reward, done, task_id=task_id)
-        # Flat buffer: for imagination seeding (actor/critic)
         flat_buffer.add(
             current_obs_embed, real_action, reward, next_obs_embed, done, task_id=task_id
         )
@@ -453,12 +497,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         reward_normalizer.update_statistics([reward])
         prev_action = action_tensor
 
-        # ---- Train RSSM sequentially on episode chunks ----
-        # Sampling is filtered to THIS cluster's episodes where possible (falls
-        # back to the full episode pool if the cluster is too new — see
-        # SequenceReplayBuffer.sample_sequences). Without this filter, a
-        # task's RSSM would be trained on dynamics collected under a
-        # different cluster's transitions, undermining per-task world models.
         wm_metrics = {}
         btn_metrics = {}
         if len(seq_buffer) >= min_episodes:
@@ -479,7 +517,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                     base_encoder.train()
                     encoder_optimizer.zero_grad()
 
-                # Sequential RSSM training — h propagated through L steps
                 wm_metrics = active_wm_trainer.train_step_sequence(
                     obs_b, act_b, rew_b, done_b
                 )
@@ -489,11 +526,9 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                     encoder_optimizer.step()
                     base_encoder.eval()
 
-                # BTN training on states derived from sequential RSSM pass
                 if active_btn_trainer is not None:
                     with torch.no_grad():
                         active_rssm.posterior_net.eval()
-                        # Use middle of sequence for BTN training (h is warm by then)
                         mid = seq_len // 2
                         h_b, z_b = active_rssm.initial_state(batch_size, device)
                         pa = torch.zeros(batch_size, action_dim, device=device)
@@ -506,11 +541,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                         states_for_btn = active_rssm.get_state_features(h_b, z_b)
                     btn_metrics = active_btn_trainer.train_step(states_for_btn)
 
-        # ---- Imagination rollout seeded from flat buffer ----
-        # Seeding is filtered to THIS cluster's transitions where possible
-        # (falls back to the full buffer if the cluster is too new — see
-        # LegionReplayBuffer.sample). This is the actor-critic-side half of
-        # the same isolation fix as above.
         flat_min = batch_size * 4
         if len(flat_buffer) >= flat_min:
             seed_batch = flat_buffer.sample(batch_size, task_id=task_id)
@@ -522,7 +552,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             seed_obs = current_obs_embed.expand(batch_size, -1).clone()
             seed_act = torch.zeros(batch_size, action_dim, device=device)
 
-        # Seed RSSM from flat buffer obs
         with torch.no_grad():
             h_seed, z_seed = active_rssm.initial_state(batch_size, device)
             active_rssm.posterior_net.eval()
@@ -577,14 +606,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         imagined_entropy_t = torch.stack(imagined_entropy)
         imagined_raw_means_t = torch.stack(imagined_raw_means)
 
-        # ---- Actor/critic warmup gate ----
-        # Only take gradient steps once THIS task's world model has accrued
-        # wm_warmup_updates real training updates of its own (see comment at
-        # wm_warmup_updates definition above for why this matters). Before
-        # that, imagination still runs so the code path stays exercised and
-        # the loop's timing/shape stays consistent, but no optimizer step is
-        # taken — the policy simply doesn't move until the dynamics it's
-        # being shaped against are themselves non-random.
         wm_updates_so_far = task_wm_update_counts.get(task_id, 0)
         actor_critic_ready = wm_updates_so_far >= wm_warmup_updates
 
@@ -629,11 +650,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                     step,
                 )
 
-            # Diagnostic: how many DPMM clusters are active, and how the two
-            # buffers are split across them. On a single-task run (e.g.
-            # reach-v3 only) num_components should stay at 1 — if it climbs
-            # above 1, the DPMM is spuriously fragmenting one task into
-            # several undertrained heads.
             active_ids = list(task_rssms.keys())
             flat_sizes = {tid: flat_buffer.cluster_size(tid) for tid in active_ids}
             seq_sizes = {tid: seq_buffer.cluster_episode_count(tid) for tid in active_ids}
@@ -730,6 +746,9 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                 f"{dist_str}{sat_str}{cond_str}"
             )
 
+        if step % checkpoint_interval == 0 and step > 0:
+            save_checkpoint(step)
+
         if terminated or truncated:
             env.reset()
             current_pixels = get_aligned_pixels()
@@ -740,6 +759,7 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             current_pixels = next_pixels
             current_obs_embed = next_obs_embed
 
+    save_checkpoint(total_steps - 1)  # final checkpoint, regardless of interval alignment
     env.close()
     logger.close()
     print("[*] Execution completed successfully.")
