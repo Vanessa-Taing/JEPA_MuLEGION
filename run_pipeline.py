@@ -359,24 +359,42 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             action_mean_penalty=cfg["mudreamer_core"].get("action_mean_penalty", 3e-5),
         )
 
-    def save_checkpoint(step):
+    def save_checkpoint(step, path=None, best_metric_value=None):
         """
         Saves model + optimizer state for every active task cluster, plus
         the DPMM allocator's cluster profiles and the reward normalizer's
-        running statistics, in a single rolling file (overwritten each
-        call). NOTE: replay buffer contents are intentionally NOT persisted
-        — re-accumulating a few thousand transitions after resume is cheap
-        relative to checkpoint file size and save/load time, and the
-        actor/critic warmup gate (tied to real WM update COUNT, which IS
-        persisted via task_wm_update_counts) means resuming won't re-trigger
-        the untrained-world-model shock from bug #2 even with empty buffers.
+        running statistics. NOTE: replay buffer contents are intentionally
+        NOT persisted — re-accumulating a few thousand transitions after
+        resume is cheap relative to checkpoint file size and save/load
+        time, and the actor/critic warmup gate (tied to real WM update
+        COUNT, which IS persisted via task_wm_update_counts) means resuming
+        won't re-trigger the untrained-world-model shock from bug #2 even
+        with empty buffers.
+
+        path: defaults to the rolling checkpoint_path. Pass
+        best_checkpoint_path to write the separate "best eval so far" file
+        instead — see the best-checkpoint tracking block in the eval
+        section below, added because runs have been observed to hit a good
+        policy early and then drift away from it over the rest of training
+        (e.g. Mean Final Distance bottoming at 0.10 around step 10000 then
+        climbing back to 0.30-0.48 by step 29000) — the rolling
+        checkpoint_latest.pt alone would silently overwrite that early good
+        state with a later, worse one.
+
+        best_metric_value: current best Mean Final Distance seen so far
+        (lower is better), stored in the checkpoint so it survives a
+        resume — without this, resuming a run would reset "best" tracking
+        to unset and could overwrite checkpoint_best.pt with a worse result
+        that merely looks new to that process.
         """
+        target_path = path if path is not None else checkpoint_path
         state = {
             "step": step,
             "allocator_component_profiles": allocator.component_profiles,
             "task_wm_update_counts": task_wm_update_counts,
             "reward_normalizer_mean": reward_normalizer.mean,
             "reward_normalizer_var": reward_normalizer.var,
+            "best_metric_value": best_metric_value,
             "tasks": {},
         }
         for tid in task_rssms:
@@ -393,22 +411,22 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                 task_state["btn_optimizer"] = task_btn_trainers[tid].optimizer.state_dict()
             state["tasks"][tid] = task_state
 
-        tmp_path = checkpoint_path + ".tmp"
+        tmp_path = target_path + ".tmp"
         torch.save(state, tmp_path)
-        os.replace(tmp_path, checkpoint_path)  # atomic-ish swap: avoids a
+        os.replace(tmp_path, target_path)  # atomic-ish swap: avoids a
         # half-written file if the process is killed mid-save
-        print(f"[*] Checkpoint saved at step {step}: {checkpoint_path}")
+        print(f"[*] Checkpoint saved at step {step}: {target_path}")
 
     def try_resume():
         if not resume_enabled:
             print("[*] system.resume is False (default) — starting fresh. "
                   "Set system.resume: true in the config to continue from "
                   f"{checkpoint_path} if it exists.")
-            return 0
+            return 0, None
         if not os.path.exists(checkpoint_path):
             print(f"[*] system.resume is True but no checkpoint found at "
                   f"{checkpoint_path} — starting fresh.")
-            return 0
+            return 0, None
 
         print(f"[*] Resuming from checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
@@ -417,6 +435,7 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         task_wm_update_counts.update(ckpt["task_wm_update_counts"])
         reward_normalizer.mean = ckpt["reward_normalizer_mean"]
         reward_normalizer.var = ckpt["reward_normalizer_var"]
+        resumed_best_metric = ckpt.get("best_metric_value")
 
         for tid, task_state in ckpt["tasks"].items():
             ensure_task_modules(tid)  # builds fresh modules with correct shapes
@@ -432,10 +451,13 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
 
         resumed_step = ckpt["step"] + 1
         print(f"[*] Resumed at step {resumed_step} "
-              f"({len(ckpt['tasks'])} task cluster(s) restored)")
-        return resumed_step
+              f"({len(ckpt['tasks'])} task cluster(s) restored)"
+              + (f", best_metric_value so far: {resumed_best_metric:.4f}"
+                 if resumed_best_metric is not None else ""))
+        return resumed_step, resumed_best_metric
 
-    start_step = try_resume()
+    start_step, best_metric_value = try_resume()
+    best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
 
     current_pixels = get_aligned_pixels()
     current_obs_embed = encode(current_pixels)
@@ -746,8 +768,41 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
                 f"{dist_str}{sat_str}{cond_str}"
             )
 
+            # ---- Best-checkpoint tracking ----
+            # Runs have been observed to hit a good policy early (e.g. Mean
+            # Final Distance bottoming around 0.10 at step 10000) and then
+            # drift to a noticeably worse one over the rest of training
+            # (climbing back to 0.30-0.48 by the end of a 30k-step run).
+            # The rolling checkpoint_latest.pt would silently overwrite that
+            # early good state with whatever comes later, even if later is
+            # worse. This tracks the best Mean Final Distance seen so far
+            # (lower is better — it's a distance, not a reward) and saves a
+            # SEPARATE file whenever eval improves on it, so the best policy
+            # found during a run is never lost regardless of what happens
+            # afterward. Falls back to success_rate (higher is better) if
+            # mean_final_distance isn't available from this MetaWorld
+            # version's info dict.
+            improved = False
+            if "mean_final_distance" in eval_metrics:
+                candidate = eval_metrics["mean_final_distance"]
+                if best_metric_value is None or candidate < best_metric_value:
+                    best_metric_value = candidate
+                    improved = True
+            elif eval_metrics["success_rate"] > 0:
+                # success_rate has no natural "lower/higher is better"
+                # symmetry with distance, so only used as a fallback when
+                # distance isn't available at all.
+                if best_metric_value is None or eval_metrics["success_rate"] > best_metric_value:
+                    best_metric_value = eval_metrics["success_rate"]
+                    improved = True
+
+            if improved:
+                save_checkpoint(step, path=best_checkpoint_path, best_metric_value=best_metric_value)
+                logger.writer.add_scalar("Eval/Diagnostic/BestMetricValue", best_metric_value, step)
+                print(f"  [*] New best (Mean Final Distance: {best_metric_value:.4f}) — saved to {best_checkpoint_path}")
+
         if step % checkpoint_interval == 0 and step > 0:
-            save_checkpoint(step)
+            save_checkpoint(step, best_metric_value=best_metric_value)
 
         if terminated or truncated:
             env.reset()
@@ -759,7 +814,7 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
             current_pixels = next_pixels
             current_obs_embed = next_obs_embed
 
-    save_checkpoint(total_steps - 1)  # final checkpoint, regardless of interval alignment
+    save_checkpoint(total_steps - 1, best_metric_value=best_metric_value)  # final checkpoint, regardless of interval alignment
     env.close()
     logger.close()
     print("[*] Execution completed successfully.")
