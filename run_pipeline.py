@@ -270,9 +270,28 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
     # distinct checkpoint_dir per experiment/config you don't want to mix.
     checkpoint_interval = cfg["system"].get("checkpoint_interval", 10000)
     resume_enabled = cfg["system"].get("resume", False)
+    # resume_from: "latest" (default) or "best". Lets you deliberately resume
+    # training from the checkpoint with the best eval Mean Final Distance
+    # seen so far, rather than wherever training happened to be when it
+    # stopped — useful for a fine-grained convergence pass once a run has
+    # been observed to peak early and then drift to a worse plateau.
+    # Continuing from checkpoint_latest.pt in that situation would just
+    # resume training from the WORSE state.
+    resume_from = cfg["system"].get("resume_from", "latest")
+    # reset_actor_optimizer_on_resume: if true, the actor's Adam optimizer
+    # state (momentum/variance estimates) is NOT restored on resume, even
+    # though the RSSM/critic/BTN optimizers still are. Useful when changing
+    # lr_actor for a fine-tuning phase — Adam's per-parameter adaptive state
+    # was accumulated under the OLD learning rate and can cause an
+    # unexpectedly large or small first few steps if carried over into a
+    # deliberately different lr regime. The actor's WEIGHTS are still
+    # loaded either way; only the optimizer's internal momentum is skipped.
+    reset_actor_optimizer_on_resume = cfg["system"].get("reset_actor_optimizer_on_resume", False)
     checkpoint_dir = cfg["system"]["checkpoint_dir"]
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+    best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+    resume_load_path = best_checkpoint_path if resume_from == "best" else checkpoint_path
 
     def get_aligned_pixels():
         raw_frame = env.render()
@@ -421,15 +440,23 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         if not resume_enabled:
             print("[*] system.resume is False (default) — starting fresh. "
                   "Set system.resume: true in the config to continue from "
-                  f"{checkpoint_path} if it exists.")
+                  f"{resume_load_path} if it exists.")
             return 0, None
-        if not os.path.exists(checkpoint_path):
+        if not os.path.exists(resume_load_path):
             print(f"[*] system.resume is True but no checkpoint found at "
-                  f"{checkpoint_path} — starting fresh.")
+                  f"{resume_load_path} — starting fresh.")
             return 0, None
 
-        print(f"[*] Resuming from checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        print(f"[*] Resuming from checkpoint (resume_from={resume_from!r}): {resume_load_path}")
+        # weights_only=False: PyTorch 2.6 changed torch.load's default to
+        # weights_only=True, which refuses to unpickle anything beyond
+        # tensors/primitives — our checkpoint also stores numpy arrays
+        # (DPMM cluster means/vars in allocator.component_profiles) and
+        # plain dicts with int keys, which trip the new restrictive default
+        # and raise UnpicklingError. This is our own checkpoint file, saved
+        # by this same script moments/days earlier, not a third-party
+        # download — safe to opt back into full unpickling here.
+        ckpt = torch.load(resume_load_path, map_location=device, weights_only=False)
 
         allocator.component_profiles = ckpt["allocator_component_profiles"]
         task_wm_update_counts.update(ckpt["task_wm_update_counts"])
@@ -438,13 +465,21 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         resumed_best_metric = ckpt.get("best_metric_value")
 
         for tid, task_state in ckpt["tasks"].items():
-            ensure_task_modules(tid)  # builds fresh modules with correct shapes
+            ensure_task_modules(tid)  # builds fresh modules with correct shapes,
+            # including a freshly-initialized actor optimizer at whatever
+            # lr_actor is currently set in the config
             task_rssms[tid].load_state_dict(task_state["rssm"])
             task_actor_critics[tid].load_state_dict(task_state["actor_critic"])
             task_value_trainers[tid].optimizer.load_state_dict(task_state["value_optimizer"])
             task_value_trainers[tid].target_critic.load_state_dict(task_state["target_critic"])
             task_wm_trainers[tid].optimizer.load_state_dict(task_state["wm_optimizer"])
-            task_actor_trainers[tid].optimizer.load_state_dict(task_state["actor_optimizer"])
+            if reset_actor_optimizer_on_resume:
+                print(f"[*] Task {tid}: actor optimizer state NOT restored "
+                      f"(reset_actor_optimizer_on_resume=true) — starting "
+                      f"fresh Adam state at lr_actor="
+                      f"{cfg['mudreamer_core']['optimizer']['lr_actor']}")
+            else:
+                task_actor_trainers[tid].optimizer.load_state_dict(task_state["actor_optimizer"])
             if "btn" in task_state and tid in task_btns:
                 task_btns[tid].load_state_dict(task_state["btn"])
                 task_btn_trainers[tid].optimizer.load_state_dict(task_state["btn_optimizer"])
@@ -457,7 +492,6 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
         return resumed_step, resumed_best_metric
 
     start_step, best_metric_value = try_resume()
-    best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
 
     current_pixels = get_aligned_pixels()
     current_obs_embed = encode(current_pixels)

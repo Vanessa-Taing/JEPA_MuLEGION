@@ -5,9 +5,11 @@ system:
   log_interval: 1000
   eval_interval: 1000
   eval_episodes: 5
-  total_steps: 50000 #150000 baseline
+  total_steps: 75000 #150000 baseline
   checkpoint_interval: 10000
-  resume: false
+  resume: true
+  resume_from: best
+  reset_actor_optimizer_on_resume: true
 
 encoder_warmup_steps: 2000
 
@@ -47,8 +49,9 @@ mudreamer_core:
   networks:
     hidden_dim: 256
     activation: "elu"
+  lr_actor_finetune_note: "lower lr_actor below for this phase, e.g. 0.00001 (was 0.00003)"
   optimizer:
-    lr_actor: 0.00003
+    lr_actor: 0.00001
     lr_critic: 0.0001
     lr_predictor: 0.0001
 
