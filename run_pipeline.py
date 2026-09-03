@@ -191,12 +191,29 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
     )
 
     print("[*] Initializing Meta-World environment...")
-    task_name = "reach-v3"
+    task_list = cfg["environment"].get("tasks", ["reach-v3"])
+    steps_per_task = cfg["environment"].get("steps_per_task", cfg["system"]["total_steps"])
+    current_task_idx = 0
+    task_name = task_list[current_task_idx]
     mt1 = metaworld.MT1(task_name)
     env = mt1.train_classes[task_name](render_mode="rgb_array")
     task = mt1.train_tasks[0]
     env.set_task(task)
     obs, info = env.reset()
+
+    def switch_task(idx):
+        """Swaps env/mt1/task to task_list[idx]. Live RSSM state reset — new
+        task = new visual distribution, so the DPMM should route this to a
+        new cluster on the next allocator call regardless."""
+        nonlocal env, mt1, task, task_name
+        env.close()
+        task_name = task_list[idx]
+        mt1 = metaworld.MT1(task_name)
+        env = mt1.train_classes[task_name](render_mode="rgb_array")
+        task = mt1.train_tasks[0]
+        env.set_task(task)
+        env.reset()
+        print(f"[!] LEGION: Switched to task '{task_name}' (task {idx+1}/{len(task_list)})")
 
     obs_embed_dim = cfg["lewm_encoder"]["embed_dim"]
     action_dim = cfg["environment"]["action_dim"]
@@ -502,6 +519,11 @@ def run_legion_jepa_dreamer_loop(config_path="config/legion_jepa_dreamer.yaml"):
     bootstrap_state = torch.zeros(1, state_dim, device=device)
 
     for step in range(start_step, total_steps):
+        target_idx = min(step // steps_per_task, len(task_list) - 1)
+        if target_idx != current_task_idx:
+            current_task_idx = target_idx
+            switch_task(current_task_idx)
+            live_h = None  # force RSSM re-init on next iteration
 
         if live_h is not None and current_task_id is not None:
             alloc_state = task_rssms[current_task_id].get_state_features(live_h, live_z)

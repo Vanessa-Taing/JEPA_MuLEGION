@@ -66,11 +66,8 @@ btn:
 
 environment:
   suite: "metaworld"
-  tasks:
-    - reach-v3
-    - push-v3
-    - pick-place-v3
-    - door-open-v3
+  tasks: [reach-v3, push-v3]
+  # full list [reach-v3, push-v3, pick-place-v3, door-open-v3]
   render_mode: "rgb_array"
   action_dim: 4
   reward_mapping:
